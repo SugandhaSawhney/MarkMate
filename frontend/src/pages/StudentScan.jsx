@@ -7,13 +7,43 @@ import { Link } from 'react-router-dom';
 
 export default function StudentScan() {
   const { user } = useAuth();
-  const [status, setStatus] = useState('idle'); // idle | scanning | success | error
+  const [status, setStatus] = useState('idle');
   const [message, setMessage] = useState('');
   const [scanning, setScanning] = useState(false);
+  const [coords, setCoords] = useState(null);         // ← GPS stored early
+  const [gpsStatus, setGpsStatus] = useState('fetching'); // fetching | ok | denied
   const scannerRef = useRef(null);
-  const scannerInstanceRef = useRef(null);
+
+  // ✅ FIX 2 — Get GPS immediately when page loads
+  useEffect(() => {
+    setGpsStatus('fetching');
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        setGpsStatus('ok');
+      },
+      () => setGpsStatus('denied'),
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 }
+    );
+  }, []);
+
+  // ✅ Also keep refreshing GPS every 30s so it stays fresh
+  useEffect(() => {
+    const interval = setInterval(() => {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          setCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+          setGpsStatus('ok');
+        },
+        () => {},
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+      );
+    }, 30000);
+    return () => clearInterval(interval);
+  }, []);
 
   const startScanner = () => {
+    if (gpsStatus !== 'ok') return;
     setScanning(true);
     setStatus('scanning');
     setMessage('');
@@ -21,56 +51,79 @@ export default function StudentScan() {
 
   useEffect(() => {
     if (!scanning) return;
-    const scanner = new Html5QrcodeScanner('qr-reader', { fps: 10, qrbox: 250 }, false);
-    scannerInstanceRef.current = scanner;
+
+    const scanner = new Html5QrcodeScanner(
+      'qr-reader',
+      { fps: 10, qrbox: 250, facingMode: 'environment' },
+      false
+    );
 
     scanner.render(
       async (decodedText) => {
+         console.log('SCANNED TEXT:', decodedText);  // ← add this
+    console.log('STARTS WITH eyJ?', decodedText.startsWith('eyJ')); // JWT always starts with eyJ
+   
         scanner.clear();
         setScanning(false);
+        setStatus('loading');
 
-        // Get GPS
-        navigator.geolocation.getCurrentPosition(
-          async (pos) => {
-            try {
-              const { data } = await api.post('/attendance/mark', {
-                qrToken: decodedText,
-                latitude: pos.coords.latitude,
-                longitude: pos.coords.longitude,
-              });
-              setStatus('success');
-              setMessage(data.message);
-            } catch (err) {
-              setStatus('error');
-              setMessage(err.response?.data?.message || 'Attendance failed');
-            }
-          },
-          () => {
-            setStatus('error');
-            setMessage('Location access denied. Enable GPS to mark attendance.');
-          }
-        );
+        // ✅ FIX 2 — coords already available, fire API immediately
+        if (!coords) {
+          setStatus('error');
+          setMessage('Location not available. Please refresh and try again.');
+          return;
+        }
+
+        try {
+          const { data } = await api.post('/attendance/mark', {
+            qrToken: decodedText,
+            latitude: coords.lat,
+            longitude: coords.lng,
+          });
+          setStatus('success');
+          setMessage(data.message);
+        } catch (err) {
+          setStatus('error');
+          setMessage(err.response?.data?.message || 'Attendance failed');
+        }
       },
-      (err) => {}
+      () => {}
     );
 
-    return () => {
-      scanner.clear().catch(() => {});
-    };
-  }, [scanning]);
+    return () => { scanner.clear().catch(() => {}); };
+  }, [scanning, coords]);
 
   return (
     <div className="min-h-screen bg-surface-900">
       <Navbar />
       <div className="pt-20 px-4 pb-12 max-w-lg mx-auto">
 
-        {/* Header */}
         <div className="mb-8 fade-in">
           <p className="text-xs font-mono text-brand-500/60 uppercase tracking-widest mb-1">Student Portal</p>
           <h1 className="font-display text-4xl font-bold text-white">
             Hi, <span className="gradient-text">{user?.name?.split(' ')[0]}</span>
           </h1>
-          <p className="text-gray-500 font-body mt-1">Scan the classroom QR to mark attendance</p>
+        </div>
+
+        {/* GPS Status Bar — always visible */}
+        <div className={`mb-4 px-4 py-3 rounded-xl flex items-center gap-3 text-sm font-mono fade-in ${
+          gpsStatus === 'ok'
+            ? 'bg-brand-500/10 border border-brand-500/30 text-brand-400'
+            : gpsStatus === 'denied'
+            ? 'bg-red-500/10 border border-red-500/30 text-red-400'
+            : 'bg-yellow-500/10 border border-yellow-500/30 text-yellow-400'
+        }`}>
+          {gpsStatus === 'fetching' && (
+            <><div className="w-4 h-4 border border-yellow-400 border-t-transparent rounded-full animate-spin" />
+            Fetching your location...</>
+          )}
+          {gpsStatus === 'ok' && (
+            <><div className="w-2 h-2 bg-brand-400 rounded-full pulse-dot" />
+            GPS Ready — {coords?.lat.toFixed(4)}, {coords?.lng.toFixed(4)}</>
+          )}
+          {gpsStatus === 'denied' && (
+            <>⚠ Location denied — enable GPS in browser settings</>
+          )}
         </div>
 
         {/* Scanner Card */}
@@ -80,7 +133,6 @@ export default function StudentScan() {
             Mark Attendance
           </h2>
 
-          {/* Status display */}
           {status === 'success' && (
             <div className="mb-6 p-5 rounded-2xl bg-brand-500/10 border border-brand-500/30 text-center fade-in">
               <div className="text-5xl mb-3">✅</div>
@@ -97,31 +149,45 @@ export default function StudentScan() {
             </div>
           )}
 
-          {/* QR Scanner */}
-          {scanning && (
-            <div className="mb-4 rounded-xl overflow-hidden border border-brand-500/20 fade-in" id="qr-reader" ref={scannerRef} />
+          {status === 'loading' && (
+            <div className="mb-6 p-5 rounded-2xl bg-surface-700 border border-brand-500/10 text-center fade-in">
+              <div className="w-10 h-10 border-2 border-brand-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
+              <p className="font-mono text-sm text-gray-400">Verifying attendance...</p>
+            </div>
           )}
 
-          {!scanning && (
+          {scanning && (
+            <div className="mb-4 rounded-xl overflow-hidden border border-brand-500/20 fade-in"
+              id="qr-reader" ref={scannerRef} />
+          )}
+
+          {!scanning && status !== 'loading' && (
             <div className="flex flex-col items-center py-8 gap-6">
               {status === 'idle' && (
                 <div className="w-32 h-32 rounded-2xl border-2 border-dashed border-brand-500/30 flex items-center justify-center">
                   <span className="text-5xl opacity-30">◻</span>
                 </div>
               )}
-              <button onClick={startScanner}
-                className="btn-primary px-10 py-3 rounded-xl text-sm tracking-wide">
-                {status === 'idle' ? '📷 Open Camera & Scan' : '🔄 Scan Again'}
+              <button
+                onClick={startScanner}
+                disabled={gpsStatus !== 'ok'}
+                className={`px-10 py-3 rounded-xl text-sm tracking-wide font-display font-bold transition-all ${
+                  gpsStatus === 'ok'
+                    ? 'btn-primary'
+                    : 'bg-gray-700 text-gray-500 cursor-not-allowed'
+                }`}>
+                {gpsStatus === 'fetching' ? '⏳ Waiting for GPS...' :
+                 gpsStatus === 'denied'   ? '⚠ GPS Required' :
+                 status === 'idle'        ? '📷 Open Camera & Scan' : '🔄 Scan Again'}
               </button>
+
+              {gpsStatus !== 'ok' && (
+                <p className="text-xs text-gray-600 font-mono text-center">
+                  Camera will unlock once GPS is confirmed
+                </p>
+              )}
             </div>
           )}
-
-          <div className="mt-4 flex items-start gap-2 p-3 rounded-xl bg-surface-700 border border-brand-500/5">
-            <span className="text-brand-400 text-xs mt-0.5">ℹ</span>
-            <p className="text-xs text-gray-500 font-body">
-              Make sure GPS is enabled. You must be within the classroom radius. QR codes expire every 60 seconds.
-            </p>
-          </div>
         </div>
 
         <div className="mt-4 text-center">
